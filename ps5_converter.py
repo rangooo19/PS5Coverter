@@ -44,6 +44,27 @@ OUTPUT_FORMATS = {
     "MP4 — всегда H.264 (HDR → SDR, тонмаппинг)": "h264",
 }
 
+# Звуковые кодеки, которые можно копировать в MP4 без перекодирования
+# (Opus из WebM сюда не входит: DaVinci Resolve его в MP4 не читает).
+MP4_COPY_AUDIO = {"aac", "mp3", "ac3", "eac3", "alac"}
+
+STD_FPS = (23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60, 100, 119.88, 120)
+NTSC_FRACTIONS = {23.976: "24000/1001", 29.97: "30000/1001",
+                  59.94: "60000/1001", 119.88: "120000/1001"}
+
+
+def snap_fps(fps):
+    """Привязывает измеренную частоту кадров к стандартной (60, 59.94, 30 …)."""
+    if fps <= 0:
+        return 0.0
+    best = min(STD_FPS, key=lambda x: abs(x - fps))
+    return best if abs(best - fps) / best < 0.03 else round(fps, 3)
+
+
+def fps_arg(fps):
+    return NTSC_FRACTIONS.get(fps, f"{fps:g}")
+
+
 # Тонмаппинг HDR (PQ, BT.2020) -> SDR (BT.709). Работает на CPU, на 4K60 медленно.
 TONEMAP_VF = (
     "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
@@ -179,12 +200,13 @@ def detect_encoders(ffmpeg):
 
 def probe_video(ffprobe, path):
     info = {"duration": 0.0, "width": 0, "height": 0, "fps": 0.0, "pix_fmt": "",
-            "transfer": "", "primaries": "", "hdr": False}
+            "transfer": "", "primaries": "", "hdr": False,
+            "audio_codec": "", "vfr": False, "cfr_fps": 0.0}
     try:
         r = run_quiet([
             ffprobe, "-v", "error", "-select_streams", "v:0",
             "-show_entries",
-            "stream=width,height,r_frame_rate,pix_fmt,color_transfer,color_primaries"
+            "stream=width,height,r_frame_rate,avg_frame_rate,pix_fmt,color_transfer,color_primaries"
             ":format=duration",
             "-of", "json", path])
         data = json.loads(r.stdout)
@@ -196,7 +218,19 @@ def probe_video(ffprobe, path):
         info["primaries"] = st.get("color_primaries", "")
         num, den = st.get("r_frame_rate", "0/1").split("/")
         info["fps"] = float(num) / float(den) if float(den) else 0.0
+        a_num, a_den = st.get("avg_frame_rate", "0/1").split("/")
+        avg = float(a_num) / float(a_den) if float(a_den) else 0.0
+        if info["fps"] and avg and abs(info["fps"] - avg) / info["fps"] > 0.02:
+            info["vfr"] = True
+        info["cfr_fps"] = snap_fps(avg or info["fps"])
         info["duration"] = float(data.get("format", {}).get("duration") or 0)
+    except Exception:
+        pass
+    try:
+        ra = run_quiet([ffprobe, "-v", "error", "-select_streams", "a:0",
+                        "-show_entries", "stream=codec_name", "-of", "json", path])
+        streams = json.loads(ra.stdout).get("streams", [])
+        info["audio_codec"] = streams[0].get("codec_name", "") if streams else ""
     except Exception:
         pass
     ten_bit = "10" in info["pix_fmt"] or "12" in info["pix_fmt"]
@@ -228,7 +262,8 @@ def plan_for(info, mode, look=""):
     return "hdr_hevc" if mode == "auto" else "tonemap"
 
 
-def build_command(ffmpeg, enc, info, src, dst, quality, mode, look="", strength=100, grain=0):
+def build_command(ffmpeg, enc, info, src, dst, quality, mode, look="", strength=100, grain=0,
+                  audio_copy=False, cfr=False):
     cq = QUALITY[quality]
     plan = plan_for(info, mode, look)
     codec = enc["hevc"] if plan == "hdr_hevc" else enc["h264"]
@@ -273,7 +308,15 @@ def build_command(ffmpeg, enc, info, src, dst, quality, mode, look="", strength=
         cmd += ["-pix_fmt", "yuv420p", "-color_primaries", "bt709",
                 "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv"]
 
-    cmd += ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+    if cfr:
+        cmd += ["-fps_mode", "cfr"]
+        if info.get("cfr_fps"):
+            cmd += ["-r", fps_arg(info["cfr_fps"])]
+    if audio_copy and info.get("audio_codec") in MP4_COPY_AUDIO:
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", "192k"]
+    cmd += ["-movflags", "+faststart",
             "-progress", "pipe:1", "-nostats", dst]
     return cmd
 
@@ -320,8 +363,8 @@ class App(BaseApp):
     def __init__(self):
         super().__init__()
         self.title("PS5 WebM → MP4 Converter")
-        self.geometry("640x860")
-        self.minsize(580, 790)
+        self.geometry("640x930")
+        self.minsize(580, 860)
 
         self.src_path = None
         self.info = None
@@ -393,6 +436,20 @@ class App(BaseApp):
         self.quality_menu.set("Высокое (больше размер)")
         self.quality_menu.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(2, 0))
 
+        self.audio_copy = tk.BooleanVar(value=False)
+        self.cfr = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(opts, text="Копировать звук без изменений",
+                        variable=self.audio_copy,
+                        command=self._refresh_audio_hint).grid(
+            row=2, column=0, sticky="w", pady=(10, 0))
+        ctk.CTkCheckBox(opts, text="Постоянная частота кадров (CFR)",
+                        variable=self.cfr,
+                        command=self._refresh_audio_hint).grid(
+            row=2, column=1, sticky="w", padx=(12, 0), pady=(10, 0))
+        self.audio_hint = ctk.CTkLabel(opts, text="", text_color="gray70",
+                                       anchor="w", justify="left", wraplength=560)
+        self.audio_hint.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
         grade = ctk.CTkFrame(self, fg_color="transparent")
         grade.grid(row=5, column=0, padx=28, pady=(10, 0), sticky="ew")
         grade.grid_columnconfigure(0, weight=3)
@@ -443,6 +500,30 @@ class App(BaseApp):
         self.status = ctk.CTkLabel(self, text="Выберите файл", text_color="gray70",
                                    wraplength=560)
         self.status.grid(row=10, column=0, padx=28, pady=(0, 16))
+
+    def _refresh_audio_hint(self):
+        info = self.info
+        if not info:
+            self.audio_hint.configure(text="")
+            return
+        codec = info["audio_codec"]
+        if not codec:
+            audio = "Звуковой дорожки в файле нет."
+        elif self.audio_copy.get() and codec in MP4_COPY_AUDIO:
+            audio = f"Звук ({codec.upper()}) копируется без перекодирования."
+        elif self.audio_copy.get():
+            audio = (f"Звук {codec.upper()} нельзя скопировать в MP4 без проблем "
+                     "в DaVinci — будет перекодирован в AAC 192 кбит/с.")
+        else:
+            audio = f"Звук ({codec.upper()}) → AAC 192 кбит/с."
+        if info["vfr"] and self.cfr.get():
+            video = (f" Переменная частота кадров будет выровнена до "
+                     f"{info['cfr_fps']:g} fps.")
+        elif info["vfr"]:
+            video = " Видео с переменной частотой кадров: рекомендуем включить CFR."
+        else:
+            video = ""
+        self.audio_hint.configure(text=audio + video)
 
     def _on_strength(self, value):
         self.strength_label.configure(text=f"Сила эффекта: {int(value)}%")
@@ -512,6 +593,7 @@ class App(BaseApp):
             self.drop_label.configure(
                 text=f"✔  {os.path.basename(path)}\n{describe(info)}")
             self._refresh_hint()
+            self._refresh_audio_hint()
         self.after(0, apply)
 
     def _pick_file(self):
@@ -588,7 +670,8 @@ class App(BaseApp):
         self._set_busy(True)
         dst = unique_output(self.src_path)
         cmd = build_command(self.ffmpeg, self.enc, self.info, self.src_path, dst,
-                            self.quality_menu.get(), mode, look, self.strength.get(), self.grain.get())
+                            self.quality_menu.get(), mode, look, self.strength.get(), self.grain.get(),
+                            self.audio_copy.get(), self.cfr.get())
         threading.Thread(target=self._worker, args=(cmd, dst, self.info["duration"]),
                          daemon=True).start()
 
