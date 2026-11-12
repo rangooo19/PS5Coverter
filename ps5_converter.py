@@ -55,10 +55,22 @@ TONEMAP_VF = (
 # Это приближения «по ощущению», а не точные копии фильтров Instagram.
 LOOKS = {
     "Без цветокора": "",
-    "Los Angeles (тёплый, яркий)": (
-        "eq=contrast=1.06:brightness=0.02:saturation=1.15,"
-        "colorbalance=rs=0.02:bs=-0.02:rm=0.05:gm=0.02:bm=-0.05:rh=0.05:gh=0.03:bh=-0.06,"
-        "curves=all='0/0 0.25/0.22 0.5/0.53 0.75/0.80 1/1'"
+    # Розово-неоновый LA: приподнятые фиолетовые тени, розово-пурпурные средние тона,
+    # тёплые света, небо остаётся голубым (подобрано по цветам референса).
+    "Los Angeles (розовый неон)": (
+        "curves=r='0/0.08 0.4/0.44 1/1':g='0/0.06 0.4/0.35 1/0.97':b='0/0.13 0.4/0.42 1/0.95',"
+        "eq=contrast=1.04:saturation=1.12"
+    ),
+    # Закат / золотой час: янтарно-оранжевые света и средние тона, мягкий контраст.
+    "Закат / золотой час (оранжевый)": (
+        "curves=r='0/0.03 0.5/0.60 1/1':g='0/0.01 0.5/0.46 1/0.92':b='0/0.03 0.5/0.38 1/0.88',"
+        "eq=contrast=1.06:saturation=1.15"
+    ),
+    # Хэллоуин: тёмный, фиолетовые тени, оранжевые света, сильная виньетка.
+    "Хэллоуин (тёмный, оранж + фиолет)": (
+        "curves=r='0/0.06 0.3/0.26 0.7/0.78 1/1':g='0/0 0.5/0.40 1/0.82':b='0/0.10 0.3/0.28 0.7/0.50 1/0.62',"
+        "eq=contrast=1.12:brightness=-0.02:saturation=0.95,"
+        "vignette=PI/4.5"
     ),
     "Teal & Orange (кино)": (
         "eq=contrast=1.1:saturation=1.1,"
@@ -79,15 +91,29 @@ def look_filter(look, strength):
     return f"split[o][g];[g]{body}[g2];[g2][o]blend=all_opacity={s:.2f}"
 
 
-def video_filters(info, plan, look, strength, scale=None):
+def grain_filter(grain):
+    """Плёночное зерно: grain 0-100. Яркостное зерно + чуть-чуть цветного, меняется по кадрам."""
+    g = max(0, min(int(grain), 100))
+    if g == 0:
+        return ""
+    luma = max(1, round(g * 0.2))
+    chroma = max(1, round(luma * 0.3))
+    return (f"noise=c0s={luma}:c0f=t+u:c1s={chroma}:c1f=t+u:c2s={chroma}:c2f=t+u")
+
+
+def video_filters(info, plan, look, strength, grain=0, pre_scale=None):
+    """Цепочка: [уменьшение для предпросмотра] → [тонмаппинг HDR] → цветокор → зерно."""
     parts = []
+    if pre_scale:
+        parts.append(pre_scale)
     if plan == "tonemap":
         parts.append(TONEMAP_VF)
     lf = look_filter(look, strength)
     if lf:
         parts.append(lf)
-    if scale:
-        parts.append(scale)
+        gf = grain_filter(grain)
+        if gf:
+            parts.append(gf)
     return ",".join(parts)
 
 
@@ -202,14 +228,14 @@ def plan_for(info, mode, look=""):
     return "hdr_hevc" if mode == "auto" else "tonemap"
 
 
-def build_command(ffmpeg, enc, info, src, dst, quality, mode, look="", strength=100):
+def build_command(ffmpeg, enc, info, src, dst, quality, mode, look="", strength=100, grain=0):
     cq = QUALITY[quality]
     plan = plan_for(info, mode, look)
     codec = enc["hevc"] if plan == "hdr_hevc" else enc["h264"]
 
     cmd = [ffmpeg, "-hide_banner", "-y", "-hwaccel", "auto", "-i", src,
            "-map", "0:v:0", "-map", "0:a?"]
-    vf = video_filters(info, plan, look, strength)
+    vf = video_filters(info, plan, look, strength, grain)
     if vf:
         cmd += ["-vf", vf]
 
@@ -252,14 +278,14 @@ def build_command(ffmpeg, enc, info, src, dst, quality, mode, look="", strength=
     return cmd
 
 
-def render_preview(ffmpeg, info, src, look, strength, outdir):
+def render_preview(ffmpeg, info, src, look, strength, grain, outdir):
     """Два кадра из середины ролика: оригинал и с цветокором (для окна предпросмотра)."""
     t = max(info["duration"] / 2, 0)
     plan = "tonemap" if info["hdr"] else "sdr"
     paths = []
     for name, lk in (("orig.png", ""), ("graded.png", look)):
         out = os.path.join(outdir, name)
-        vf = video_filters(info, plan, lk, strength, scale="scale=640:-2")
+        vf = video_filters(info, plan, lk, strength, grain, pre_scale="scale=640:-2")
         r = run_quiet([ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                        "-ss", f"{t:.2f}", "-i", src, "-frames:v", "1",
                        "-vf", vf, out], timeout=120)
@@ -294,8 +320,8 @@ class App(BaseApp):
     def __init__(self):
         super().__init__()
         self.title("PS5 WebM → MP4 Converter")
-        self.geometry("640x790")
-        self.minsize(580, 720)
+        self.geometry("640x860")
+        self.minsize(580, 790)
 
         self.src_path = None
         self.info = None
@@ -382,6 +408,13 @@ class App(BaseApp):
         self.strength.set(80)
         self.strength.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(2, 0))
 
+        self.grain_label = ctk.CTkLabel(grade, text="Зернистость: 40%", anchor="w")
+        self.grain_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.grain = ctk.CTkSlider(grade, from_=0, to=100, number_of_steps=20,
+                                   command=self._on_grain)
+        self.grain.set(40)
+        self.grain.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+
         self.preview_btn = ctk.CTkButton(self, text="Предпросмотр кадра (до / после)",
                                          height=34, fg_color="transparent", border_width=2,
                                          command=self._preview)
@@ -413,6 +446,9 @@ class App(BaseApp):
 
     def _on_strength(self, value):
         self.strength_label.configure(text=f"Сила эффекта: {int(value)}%")
+
+    def _on_grain(self, value):
+        self.grain_label.configure(text=f"Зернистость: {int(value)}%")
 
     def _refresh_hint(self):
         """Подсказка о том, что именно будет сделано с выбранным файлом."""
@@ -507,14 +543,14 @@ class App(BaseApp):
             return
         self.preview_btn.configure(state="disabled", text="Готовлю кадр…")
         threading.Thread(target=self._preview_worker,
-                         args=(self.src_path, dict(self.info), look, self.strength.get()),
+                         args=(self.src_path, dict(self.info), look, self.strength.get(), self.grain.get()),
                          daemon=True).start()
 
-    def _preview_worker(self, src, info, look, strength):
+    def _preview_worker(self, src, info, look, strength, grain):
         paths, err = None, None
         try:
             outdir = tempfile.mkdtemp(prefix="ps5prev_")
-            paths = render_preview(self.ffmpeg, info, src, look, strength, outdir)
+            paths = render_preview(self.ffmpeg, info, src, look, strength, grain, outdir)
         except Exception as e:  # noqa: BLE001
             err = str(e)
         self.after(0, self._show_preview, paths, err)
@@ -552,7 +588,7 @@ class App(BaseApp):
         self._set_busy(True)
         dst = unique_output(self.src_path)
         cmd = build_command(self.ffmpeg, self.enc, self.info, self.src_path, dst,
-                            self.quality_menu.get(), mode, look, self.strength.get())
+                            self.quality_menu.get(), mode, look, self.strength.get(), self.grain.get())
         threading.Thread(target=self._worker, args=(cmd, dst, self.info["duration"]),
                          daemon=True).start()
 
