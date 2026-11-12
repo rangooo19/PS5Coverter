@@ -14,7 +14,9 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
+import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
@@ -48,6 +50,45 @@ TONEMAP_VF = (
     "tonemap=tonemap=hable:desat=0,"
     "zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
 )
+
+# Цветокор-пресеты. Работают в SDR (HDR перед ними переводится в SDR).
+# Это приближения «по ощущению», а не точные копии фильтров Instagram.
+LOOKS = {
+    "Без цветокора": "",
+    "Los Angeles (тёплый, яркий)": (
+        "eq=contrast=1.06:brightness=0.02:saturation=1.15,"
+        "colorbalance=rs=0.02:bs=-0.02:rm=0.05:gm=0.02:bm=-0.05:rh=0.05:gh=0.03:bh=-0.06,"
+        "curves=all='0/0 0.25/0.22 0.5/0.53 0.75/0.80 1/1'"
+    ),
+    "Teal & Orange (кино)": (
+        "eq=contrast=1.1:saturation=1.1,"
+        "colorbalance=rs=-0.06:bs=0.07:rh=0.08:gh=0.02:bh=-0.08"
+    ),
+    "Чёрно-белый (контрастный)": "hue=s=0,eq=contrast=1.15",
+}
+
+
+def look_filter(look, strength):
+    """Строка фильтра цветокора; strength 0-100 — смешивание с оригиналом."""
+    body = LOOKS.get(look, "")
+    if not body:
+        return ""
+    s = max(0, min(int(strength), 100)) / 100
+    if s >= 0.99:
+        return body
+    return f"split[o][g];[g]{body}[g2];[g2][o]blend=all_opacity={s:.2f}"
+
+
+def video_filters(info, plan, look, strength, scale=None):
+    parts = []
+    if plan == "tonemap":
+        parts.append(TONEMAP_VF)
+    lf = look_filter(look, strength)
+    if lf:
+        parts.append(lf)
+    if scale:
+        parts.append(scale)
+    return ",".join(parts)
 
 
 # ----------------------------------------------------------------- ffmpeg ---
@@ -152,22 +193,25 @@ def describe(info):
     return " • ".join(parts)
 
 
-def plan_for(info, mode):
-    """sdr | hdr_hevc | tonemap"""
+def plan_for(info, mode, look=""):
+    """sdr | hdr_hevc | tonemap (цветокор всегда делается в SDR)"""
     if not info["hdr"]:
         return "sdr"
+    if LOOKS.get(look):
+        return "tonemap"
     return "hdr_hevc" if mode == "auto" else "tonemap"
 
 
-def build_command(ffmpeg, enc, info, src, dst, quality, mode):
+def build_command(ffmpeg, enc, info, src, dst, quality, mode, look="", strength=100):
     cq = QUALITY[quality]
-    plan = plan_for(info, mode)
+    plan = plan_for(info, mode, look)
     codec = enc["hevc"] if plan == "hdr_hevc" else enc["h264"]
 
     cmd = [ffmpeg, "-hide_banner", "-y", "-hwaccel", "auto", "-i", src,
            "-map", "0:v:0", "-map", "0:a?"]
-    if plan == "tonemap":
-        cmd += ["-vf", TONEMAP_VF]
+    vf = video_filters(info, plan, look, strength)
+    if vf:
+        cmd += ["-vf", vf]
 
     if codec == "h264_nvenc":
         cmd += ["-c:v", codec, "-preset", "p5", "-tune", "hq", "-rc", "vbr",
@@ -208,6 +252,23 @@ def build_command(ffmpeg, enc, info, src, dst, quality, mode):
     return cmd
 
 
+def render_preview(ffmpeg, info, src, look, strength, outdir):
+    """Два кадра из середины ролика: оригинал и с цветокором (для окна предпросмотра)."""
+    t = max(info["duration"] / 2, 0)
+    plan = "tonemap" if info["hdr"] else "sdr"
+    paths = []
+    for name, lk in (("orig.png", ""), ("graded.png", look)):
+        out = os.path.join(outdir, name)
+        vf = video_filters(info, plan, lk, strength, scale="scale=640:-2")
+        r = run_quiet([ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                       "-ss", f"{t:.2f}", "-i", src, "-frames:v", "1",
+                       "-vf", vf, out], timeout=120)
+        if r.returncode != 0 or not os.path.exists(out):
+            raise RuntimeError((r.stderr or "ffmpeg не смог сделать кадр")[-500:])
+        paths.append(out)
+    return paths
+
+
 def unique_output(src):
     base = os.path.splitext(src)[0] + "_converted"
     out, i = base + ".mp4", 1
@@ -233,8 +294,8 @@ class App(BaseApp):
     def __init__(self):
         super().__init__()
         self.title("PS5 WebM → MP4 Converter")
-        self.geometry("640x620")
-        self.minsize(580, 580)
+        self.geometry("640x790")
+        self.minsize(580, 720)
 
         self.src_path = None
         self.info = None
@@ -306,12 +367,32 @@ class App(BaseApp):
         self.quality_menu.set("Высокое (больше размер)")
         self.quality_menu.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(2, 0))
 
+        grade = ctk.CTkFrame(self, fg_color="transparent")
+        grade.grid(row=5, column=0, padx=28, pady=(10, 0), sticky="ew")
+        grade.grid_columnconfigure(0, weight=3)
+        grade.grid_columnconfigure(1, weight=2)
+        ctk.CTkLabel(grade, text="Цветокор (стиль)", anchor="w").grid(row=0, column=0, sticky="w")
+        self.strength_label = ctk.CTkLabel(grade, text="Сила эффекта: 80%", anchor="w")
+        self.strength_label.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self.look_menu = ctk.CTkOptionMenu(grade, values=list(LOOKS),
+                                           command=lambda _v: self._refresh_hint())
+        self.look_menu.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        self.strength = ctk.CTkSlider(grade, from_=0, to=100, number_of_steps=20,
+                                      command=self._on_strength)
+        self.strength.set(80)
+        self.strength.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(2, 0))
+
+        self.preview_btn = ctk.CTkButton(self, text="Предпросмотр кадра (до / после)",
+                                         height=34, fg_color="transparent", border_width=2,
+                                         command=self._preview)
+        self.preview_btn.grid(row=6, column=0, padx=28, pady=(10, 0), sticky="ew")
+
         self.hint_label = ctk.CTkLabel(self, text="", text_color="gray70",
                                        wraplength=560, justify="left")
-        self.hint_label.grid(row=5, column=0, padx=28, pady=(8, 0), sticky="w")
+        self.hint_label.grid(row=7, column=0, padx=28, pady=(8, 0), sticky="w")
 
         btns = ctk.CTkFrame(self, fg_color="transparent")
-        btns.grid(row=6, column=0, padx=28, pady=(12, 8), sticky="ew")
+        btns.grid(row=8, column=0, padx=28, pady=(12, 8), sticky="ew")
         btns.grid_columnconfigure(0, weight=1)
         self.convert_btn = ctk.CTkButton(btns, text="Конвертировать", height=46,
                                          font=ctk.CTkFont(size=16, weight="bold"),
@@ -325,17 +406,31 @@ class App(BaseApp):
 
         self.progress = ctk.CTkProgressBar(self, height=14)
         self.progress.set(0)
-        self.progress.grid(row=7, column=0, padx=28, pady=(8, 4), sticky="ew")
+        self.progress.grid(row=9, column=0, padx=28, pady=(8, 4), sticky="ew")
         self.status = ctk.CTkLabel(self, text="Выберите файл", text_color="gray70",
                                    wraplength=560)
-        self.status.grid(row=8, column=0, padx=28, pady=(0, 16))
+        self.status.grid(row=10, column=0, padx=28, pady=(0, 16))
+
+    def _on_strength(self, value):
+        self.strength_label.configure(text=f"Сила эффекта: {int(value)}%")
 
     def _refresh_hint(self):
         """Подсказка о том, что именно будет сделано с выбранным файлом."""
         if not self.info:
             self.hint_label.configure(text="")
             return
-        plan = plan_for(self.info, OUTPUT_FORMATS[self.format_menu.get()])
+        look = self.look_menu.get()
+        plan = plan_for(self.info, OUTPUT_FORMATS[self.format_menu.get()], look)
+        if LOOKS.get(look) and self.info["hdr"]:
+            self.hint_label.configure(
+                text="Цветокор делается в SDR: HDR будет переведён в SDR (тонмаппинг), "
+                     "затем применён стиль. На CPU, на 4K60 медленнее.")
+            return
+        if LOOKS.get(look):
+            self.hint_label.configure(
+                text="Стиль применяется фильтрами ffmpeg на CPU, на 4K60 конвертация "
+                     "будет медленнее, чем без цветокора.")
+            return
         texts = {
             "sdr": "SDR-видео → H.264, цвета BT.709. Без потерь в яркости и насыщенности.",
             "hdr_hevc": "HDR сохраняется: HEVC 10-bit, BT.2020 + PQ. "
@@ -395,6 +490,49 @@ class App(BaseApp):
         if files:
             self._set_file(files[0])
 
+    # ---- предпросмотр
+    def _preview(self):
+        if not self.src_path:
+            messagebox.showinfo("Нет файла", "Сначала выберите или перетащите файл.")
+            return
+        look = self.look_menu.get()
+        if not LOOKS.get(look):
+            messagebox.showinfo("Цветокор", "Выберите стиль цветокора, чтобы увидеть разницу.")
+            return
+        if self.info is None:
+            self.info = probe_video(self.ffprobe, self.src_path)
+        if self.info["hdr"] and not self.enc["zscale"]:
+            messagebox.showerror("Нет фильтра zscale",
+                                 "Для HDR-клипа нужен ffmpeg с zscale (полная сборка gpl).")
+            return
+        self.preview_btn.configure(state="disabled", text="Готовлю кадр…")
+        threading.Thread(target=self._preview_worker,
+                         args=(self.src_path, dict(self.info), look, self.strength.get()),
+                         daemon=True).start()
+
+    def _preview_worker(self, src, info, look, strength):
+        paths, err = None, None
+        try:
+            outdir = tempfile.mkdtemp(prefix="ps5prev_")
+            paths = render_preview(self.ffmpeg, info, src, look, strength, outdir)
+        except Exception as e:  # noqa: BLE001
+            err = str(e)
+        self.after(0, self._show_preview, paths, err)
+
+    def _show_preview(self, paths, err):
+        self.preview_btn.configure(state="normal", text="Предпросмотр кадра (до / после)")
+        if err:
+            messagebox.showerror("Ошибка предпросмотра", err)
+            return
+        win = ctk.CTkToplevel(self)
+        win.title("Предпросмотр: оригинал и цветокор")
+        self._prev_imgs = [tk.PhotoImage(file=p) for p in paths]
+        for i, (title, img) in enumerate(zip(("Оригинал", "С цветокором"), self._prev_imgs)):
+            ctk.CTkLabel(win, text=title, font=ctk.CTkFont(size=15, weight="bold")).grid(
+                row=0, column=i, padx=10, pady=(10, 2))
+            tk.Label(win, image=img, bd=0).grid(row=1, column=i, padx=10, pady=(0, 10))
+        win.after(150, win.lift)
+
     # ---- конвертация
     def _start(self):
         if not self.src_path:
@@ -403,7 +541,8 @@ class App(BaseApp):
         if self.info is None:
             self.info = probe_video(self.ffprobe, self.src_path)
         mode = OUTPUT_FORMATS[self.format_menu.get()]
-        if plan_for(self.info, mode) == "tonemap" and not self.enc["zscale"]:
+        look = self.look_menu.get()
+        if plan_for(self.info, mode, look) == "tonemap" and not self.enc["zscale"]:
             messagebox.showerror(
                 "Нет фильтра zscale",
                 "В вашем ffmpeg нет zscale (libzimg), тонмаппинг невозможен.\n"
@@ -413,7 +552,7 @@ class App(BaseApp):
         self._set_busy(True)
         dst = unique_output(self.src_path)
         cmd = build_command(self.ffmpeg, self.enc, self.info, self.src_path, dst,
-                            self.quality_menu.get(), mode)
+                            self.quality_menu.get(), mode, look, self.strength.get())
         threading.Thread(target=self._worker, args=(cmd, dst, self.info["duration"]),
                          daemon=True).start()
 
